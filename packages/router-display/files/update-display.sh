@@ -7,16 +7,49 @@ MODE_FILE="/tmp/display_mode"
 MODE=$(cat "$MODE_FILE" 2>/dev/null || echo "0")
 
 # === BATTERY (shared by all modes) ===
+# Voltage sourcing strategy:
+#   1. Prefer voltage_ocv (rested, accurate) if the kernel has sampled it
+#   2. Fallback: max of 5 rapid voltage_now reads — approximates rested voltage
+#      by catching brief lulls between radio transmissions (load sag compensation)
+# SOC computed via piecewise HV Li-ion (4.35V) discharge curve.
+# Charging detection prefers charger 'online' flag; falls back to BMS status.
 BMS_PATH="/sys/class/power_supply/pm8916-bms-vm"
-VOLTAGE=$(cat "$BMS_PATH/voltage_now" 2>/dev/null)
-VMAX=$(cat "$BMS_PATH/voltage_max_design" 2>/dev/null)
-VMIN=$(cat "$BMS_PATH/voltage_min_design" 2>/dev/null)
-CHARGING_STATUS=$(cat "$BMS_PATH/status" 2>/dev/null)
-CHARGING_FLAG=""
-[ "$CHARGING_STATUS" = "Charging" ] && CHARGING_FLAG="-c"
+CHG_PATH="/sys/class/power_supply/pm8916-lbc-chgr"
 
-if [ -n "$VOLTAGE" ] && [ -n "$VMAX" ] && [ -n "$VMIN" ]; then
-    BATTERY=$(awk "BEGIN {pct = (($VOLTAGE - $VMIN) / ($VMAX - $VMIN)) * 100; if(pct < 0) pct=0; if(pct > 100) pct=100; printf \"%.0f\", pct}")
+VOLTAGE=$(cat "$BMS_PATH/voltage_ocv" 2>/dev/null)
+if [ -z "$VOLTAGE" ] || [ "$VOLTAGE" = "0" ]; then
+    VOLTAGE=$(
+        for _ in 1 2 3 4 5; do
+            cat "$BMS_PATH/voltage_now" 2>/dev/null
+        done | sort -n | tail -1
+    )
+fi
+
+CHARGING_FLAG=""
+if [ "$(cat "$CHG_PATH/online" 2>/dev/null)" = "1" ]; then
+    CHARGING_FLAG="-c"
+elif [ "$(cat "$BMS_PATH/status" 2>/dev/null)" = "Charging" ]; then
+    CHARGING_FLAG="-c"
+fi
+
+if [ -n "$VOLTAGE" ] && [ "$VOLTAGE" != "0" ]; then
+    BATTERY=$(awk -v v="$VOLTAGE" 'BEGIN {
+        mv = v / 1000
+        if      (mv >= 4350) pct = 100
+        else if (mv >= 4250) pct = 90 + (mv - 4250) * 0.10
+        else if (mv >= 4150) pct = 80 + (mv - 4150) * 0.10
+        else if (mv >= 4050) pct = 65 + (mv - 4050) * 0.15
+        else if (mv >= 3950) pct = 50 + (mv - 3950) * 0.15
+        else if (mv >= 3850) pct = 35 + (mv - 3850) * 0.15
+        else if (mv >= 3750) pct = 20 + (mv - 3750) * 0.15
+        else if (mv >= 3650) pct = 10 + (mv - 3650) * 0.10
+        else if (mv >= 3500) pct =  3 + (mv - 3500) * 0.047
+        else if (mv >= 3400) pct =      (mv - 3400) * 0.03
+        else                 pct = 0
+        if (pct < 0)   pct = 0
+        if (pct > 100) pct = 100
+        printf "%.0f", pct
+    }')
 else
     BATTERY=100
 fi

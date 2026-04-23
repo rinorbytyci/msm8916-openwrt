@@ -1,15 +1,17 @@
 #!/bin/sh
 
 # Power button handler:
-#   Short press  -> cycle display screens (default -> stats -> network -> wireguard -> wifi -> notes -> default)
-#   After 15s idle -> auto-reset to default screen (display-manager handles dim/off naturally)
-#   Hold 5s+      -> shutdown
+#   Dim/off + press -> wake to current screen only (no cycle)
+#   Bright  + press -> cycle display screens (default -> stats -> network -> wireguard -> wifi -> notes -> default)
+#   After 15s idle  -> auto-reset to default screen (display-manager handles dim/off naturally)
+#   Hold 5s+        -> shutdown
 
 [ "${ACTION}" = "released" ] || exit 0
 
 MODE_FILE="/tmp/display_mode"
 RESET_PID_FILE="/tmp/display_reset.pid"
 FIFO="/var/run/display.fifo"
+BACKLIGHT_PATH="/sys/class/backlight/backlight"
 NUM_MODES=6
 LONG_PRESS_SEC=5
 RESET_TIMEOUT=15
@@ -22,7 +24,49 @@ if [ "${SEEN:-0}" -ge "$LONG_PRESS_SEC" ]; then
     exit 0
 fi
 
-# Short press: cycle to next mode
+# Determine if display is awake (near-full brightness) or dim/off.
+# Threshold = 80% of max brightness to avoid edge cases.
+CURRENT_BRIGHTNESS=$(cat "$BACKLIGHT_PATH/brightness" 2>/dev/null || echo 0)
+MAX_BRIGHTNESS=$(cat "$BACKLIGHT_PATH/max_brightness" 2>/dev/null || echo 1785)
+WAKE_THRESHOLD=$((MAX_BRIGHTNESS * 4 / 5))
+
+schedule_reset() {
+    # Cancel any pending reset timer
+    if [ -f "$RESET_PID_FILE" ]; then
+        OLD_PID=$(cat "$RESET_PID_FILE" 2>/dev/null)
+        [ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null
+        rm -f "$RESET_PID_FILE"
+    fi
+
+    # Schedule auto-reset back to default screen after timeout
+    (
+        sleep "$RESET_TIMEOUT"
+        echo "0" > "$MODE_FILE"
+        logger -t power "Auto-reset to default screen"
+        if [ -p "$FIFO" ]; then
+            echo "update" > "$FIFO"
+        else
+            /usr/bin/update-display 2>/dev/null
+        fi
+        rm -f "$RESET_PID_FILE"
+    ) &
+    echo $! > "$RESET_PID_FILE"
+}
+
+if [ "$CURRENT_BRIGHTNESS" -lt "$WAKE_THRESHOLD" ]; then
+    # Display dim/off: wake to current screen, do NOT cycle
+    CUR_MODE=$(cat "$MODE_FILE" 2>/dev/null || echo "0")
+    logger -t power "Short press: wake (mode $CUR_MODE)"
+    if [ -p "$FIFO" ]; then
+        echo "full" > "$FIFO"
+    else
+        /usr/bin/update-display 2>/dev/null
+    fi
+    schedule_reset
+    exit 0
+fi
+
+# Display already bright: cycle to next mode
 MODE=$(cat "$MODE_FILE" 2>/dev/null || echo "0")
 MODE=$(( (MODE + 1) % NUM_MODES ))
 echo "$MODE" > "$MODE_FILE"
@@ -36,25 +80,6 @@ else
     /usr/bin/update-display 2>/dev/null
 fi
 
-# Cancel any pending reset timer
-if [ -f "$RESET_PID_FILE" ]; then
-    OLD_PID=$(cat "$RESET_PID_FILE" 2>/dev/null)
-    [ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null
-    rm -f "$RESET_PID_FILE"
-fi
-
-# Schedule auto-reset back to default screen after timeout
-(
-    sleep "$RESET_TIMEOUT"
-    echo "0" > "$MODE_FILE"
-    logger -t power "Auto-reset to default screen"
-    if [ -p "$FIFO" ]; then
-        echo "update" > "$FIFO"
-    else
-        /usr/bin/update-display 2>/dev/null
-    fi
-    rm -f "$RESET_PID_FILE"
-) &
-echo $! > "$RESET_PID_FILE"
+schedule_reset
 
 exit 0
