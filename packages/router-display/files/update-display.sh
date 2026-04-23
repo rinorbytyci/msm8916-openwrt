@@ -1,7 +1,7 @@
 #!/bin/sh
 # /usr/sbin/update-display
 # Multi-mode display update script
-# Mode selected via /tmp/display_mode (0=default, 1=stats, 2=network, 3=wireguard)
+# Mode selected via /tmp/display_mode (0=default, 1=stats, 2=network, 3=wireguard, 4=wifi, 5=notes)
 
 MODE_FILE="/tmp/display_mode"
 MODE=$(cat "$MODE_FILE" 2>/dev/null || echo "0")
