@@ -1,33 +1,60 @@
 #!/bin/sh
 
+# Power button handler:
+#   Short press  -> cycle display screens (default -> stats -> network -> wireguard -> wifi -> notes -> default)
+#   After 15s idle -> auto-reset to default screen (display-manager handles dim/off naturally)
+#   Hold 5s+      -> shutdown
+
 [ "${ACTION}" = "released" ] || exit 0
 
-# Double-click Shutdown
-# Works standalone or with display-manager
+MODE_FILE="/tmp/display_mode"
+RESET_PID_FILE="/tmp/display_reset.pid"
+FIFO="/var/run/display.fifo"
+NUM_MODES=6
+LONG_PRESS_SEC=5
+RESET_TIMEOUT=15
 
-# Hardcoded values
-lockfile="/tmp/toff.lock"
-delay=1
-
-shutdown() {
-    logger -t poweroff "Powering off..."
-
+# OpenWrt button hotplug provides SEEN = seconds button was held
+if [ "${SEEN:-0}" -ge "$LONG_PRESS_SEC" ]; then
+    logger -t power "Long press (${SEEN}s): shutdown"
     sync
     /sbin/poweroff
-}
-
-touch_lock() {
-    touch "$lockfile"
-    sleep $delay
-    rm -f "$lockfile"
-}
-
-if [ -e "$lockfile" ]; then
-    rm -f "$lockfile"
-    sleep $delay
-    shutdown
-else
-    touch_lock &
+    exit 0
 fi
+
+# Short press: cycle to next mode
+MODE=$(cat "$MODE_FILE" 2>/dev/null || echo "0")
+MODE=$(( (MODE + 1) % NUM_MODES ))
+echo "$MODE" > "$MODE_FILE"
+logger -t power "Short press: switched to screen mode $MODE"
+
+# Wake the display (resets dim/off timers in display-manager) + render new mode
+if [ -p "$FIFO" ]; then
+    echo "full" > "$FIFO"
+    echo "update" > "$FIFO"
+else
+    /usr/bin/update-display 2>/dev/null
+fi
+
+# Cancel any pending reset timer
+if [ -f "$RESET_PID_FILE" ]; then
+    OLD_PID=$(cat "$RESET_PID_FILE" 2>/dev/null)
+    [ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null
+    rm -f "$RESET_PID_FILE"
+fi
+
+# Schedule auto-reset back to default screen after timeout
+(
+    sleep "$RESET_TIMEOUT"
+    echo "0" > "$MODE_FILE"
+    logger -t power "Auto-reset to default screen"
+    if [ -p "$FIFO" ]; then
+        echo "update" > "$FIFO"
+    else
+        /usr/bin/update-display 2>/dev/null
+    fi
+    rm -f "$RESET_PID_FILE"
+) &
+echo $! > "$RESET_PID_FILE"
 
 exit 0
